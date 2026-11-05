@@ -1,34 +1,3 @@
-"""Luna Loves You: CSV-grounded RAG chatbot using hosted LLM APIs.
-
-Retrieval:
-- Reads a CSV containing question and answer columns.
-- Builds word-level and character-level TF-IDF indexes.
-- Retrieves the most relevant stored answers for each user question.
-
-Generation:
-- Sends the retrieved answers and user question to configured LLM providers.
-- Tries providers in PROVIDER_ORDER.
-- Falls back to the best stored answer if all configured providers fail.
-
-Render environment variables:
-  GROQ_API_KEY        Required to use Groq.
-  GROQ_MODEL          Defaults to openai/gpt-oss-120b.
-  GEMINI_API_KEY      Optional.
-  GEMINI_MODEL        Required when using Gemini; no default is assumed.
-  OPENROUTER_API_KEY  Optional.
-  OPENROUTER_MODEL    Required when using OpenRouter.
-  PROVIDER_ORDER      Defaults to groq,gemini,openrouter.
-  DATA_FILE           Defaults to menst_merged.csv beside this file.
-  MIN_SCORE           Defaults to 0.10.
-  FALLBACK_MIN        Defaults to 0.45.
-  TOP_ANSWERS         Defaults to 5.
-  PER_IP_PER_MIN      Defaults to 6.
-  DAILY_CAP           Defaults to 150.
-  LLM_TIMEOUT         Defaults to 35 seconds.
-
-Keep API keys in Render Environment, never in this file or GitHub.
-"""
-
 import csv
 import logging
 import os
@@ -42,11 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 _raw_data_file = os.environ.get("DATA_FILE", "menst_merged.csv").strip()
@@ -82,8 +46,6 @@ def env_value(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-# Groq's current API supports max_completion_tokens and reasoning_effort for GPT-OSS.
-# The optional reasoning fields are removed and retried if the endpoint rejects them.
 PROVIDERS = {
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -130,15 +92,9 @@ state = {
     "build_finished": False,
 }
 
-# Populated only after both vectorizers have been fitted successfully.
 idx: Dict[str, object] = {}
 cooldown: Dict[str, float] = {}
 last_error: Dict[str, str] = {}
-
-
-# ---------------------------------------------------------------------------
-# CSV loading and retrieval index
-# ---------------------------------------------------------------------------
 
 
 def _normalise_header(value: object) -> str:
@@ -146,7 +102,6 @@ def _normalise_header(value: object) -> str:
 
 
 def _read_csv_with_encoding(path: str, encoding: str) -> List[Tuple[str, str]]:
-    """Read a CSV and locate columns whose headers contain 'question' and 'answer'."""
     with open(path, "r", newline="", encoding=encoding) as file_obj:
         sample = file_obj.read(8192)
         file_obj.seek(0)
@@ -186,12 +141,10 @@ def _read_csv_with_encoding(path: str, encoding: str) -> List[Tuple[str, str]]:
             if question and answer:
                 rows.append((question, answer))
 
-    # Remove duplicate question-answer pairs while retaining source order.
     return list(dict.fromkeys(rows))
 
 
 def read_rows(path: str) -> List[Tuple[str, str]]:
-    """Read UTF-8 CSV first, then try common Windows encodings if necessary."""
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"Dataset file not found: {path}. Ensure menst_merged.csv is committed "
@@ -209,7 +162,6 @@ def read_rows(path: str) -> List[Tuple[str, str]]:
 
 
 def build_index() -> None:
-    """Build indexes before the Flask worker starts accepting requests."""
     state["build_started"] = True
     state["build_finished"] = False
     state["ready"] = False
@@ -227,9 +179,7 @@ def build_index() -> None:
         app.logger.info("Loaded %d valid question-answer rows", len(rows))
 
         if not rows:
-            raise ValueError(
-                "CSV was read, but it contains no non-empty Question/Answer rows."
-            )
+            raise ValueError("CSV was read, but it contains no non-empty Question/Answer rows.")
 
         questions = [question for question, _ in rows]
         answers: List[str] = []
@@ -243,8 +193,6 @@ def build_index() -> None:
                 answers.append(answer)
             answer_indices.append(seen_answers[answer_key])
 
-        # Word matching helps with terms and phrases. Character matching is
-        # useful for spelling variation and minor typographical differences.
         word_vectorizer = TfidfVectorizer(
             ngram_range=(1, 2),
             sublinear_tf=True,
@@ -259,20 +207,17 @@ def build_index() -> None:
             dtype=np.float32,
         )
 
-        word_matrix = None
         try:
             word_matrix = word_vectorizer.fit_transform(questions)
         except ValueError as exc:
-            # A dataset made entirely of stop words/punctuation can have no
-            # word vocabulary. Character retrieval can still work in that case.
             app.logger.warning("Word TF-IDF unavailable; using character matching only: %s", exc)
             word_vectorizer = None
+            word_matrix = None
 
         char_matrix = char_vectorizer.fit_transform(questions)
         if char_matrix.shape[1] == 0:
             raise ValueError("The question column contains no usable text for indexing.")
 
-        # Publish the complete index together, only after all fitting succeeds.
         idx.clear()
         idx.update(
             questions=questions,
@@ -302,7 +247,6 @@ def build_index() -> None:
 
 
 def retrieve(question: str, k: int = TOP_ANSWERS):
-    """Return [(answer_index, score, matched_question), ...] for distinct answers."""
     if not state["ready"]:
         return []
 
@@ -332,28 +276,17 @@ def retrieve(question: str, k: int = TOP_ANSWERS):
         if answer_index in seen_answer_indices:
             continue
         seen_answer_indices.add(answer_index)
-        output.append(
-            (answer_index, float(scores[row_index]), idx["questions"][row_index])
-        )
+        output.append((answer_index, float(scores[row_index]), idx["questions"][row_index]))
         if len(output) >= k:
             break
 
     return output
 
 
-# IMPORTANT: Do not start indexing in a daemon background thread. With Gunicorn,
-# that can allow requests to arrive before the index is ready. This synchronous
-# call completes during application import, before the worker serves requests.
 build_index()
 
 
-# ---------------------------------------------------------------------------
-# LLM provider calls
-# ---------------------------------------------------------------------------
-
-
 def clean_for_prompt(value: str) -> str:
-    """Reduce the chance that user/reference text can break our prompt delimiters."""
     return str(value).replace("<", " ").replace(">", " ").strip()
 
 
@@ -373,7 +306,6 @@ def build_user_message(question: str, hits) -> str:
 
 
 def active_providers() -> List[str]:
-    """Return providers that have both an API key and a model configured."""
     return [
         name
         for name in ORDER
@@ -395,7 +327,6 @@ def _extract_assistant_text(response_json: dict) -> str:
         if isinstance(content, str):
             result = content
         elif isinstance(content, list):
-            # Some OpenAI-compatible APIs return text as content blocks.
             parts = []
             for part in content:
                 if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
@@ -404,8 +335,6 @@ def _extract_assistant_text(response_json: dict) -> str:
         else:
             result = ""
 
-        # Remove raw reasoning tags if a provider returns them despite the
-        # request asking for hidden reasoning.
         result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
         if not result:
             finish_reason = choices[0].get("finish_reason")
@@ -448,11 +377,8 @@ def call_provider(name: str, user_message: str) -> str:
     except requests.RequestException as exc:
         raise RuntimeError(f"network request failed: {exc}") from exc
 
-    # Retry once without optional provider-specific parameters on HTTP 400.
     if response.status_code == 400 and provider["extra"]:
-        app.logger.warning(
-            "Provider %s rejected optional parameters; retrying without them", name
-        )
+        app.logger.warning("Provider %s rejected optional parameters; retrying without them", name)
         for optional_parameter in provider["extra"]:
             body.pop(optional_parameter, None)
         try:
@@ -487,12 +413,9 @@ def call_provider(name: str, user_message: str) -> str:
 
 
 def generate(user_message: str) -> Optional[str]:
-    """Try configured providers in order; return None if all providers fail."""
     providers = active_providers()
     if not providers:
-        last_error["configuration"] = (
-            "No active LLM providers. Set GROQ_API_KEY and GROQ_MODEL in Render."
-        )
+        last_error["configuration"] = "No active LLM providers. Set GROQ_API_KEY and GROQ_MODEL in Render."
         app.logger.error(last_error["configuration"])
         return None
 
@@ -514,10 +437,6 @@ def generate(user_message: str) -> Optional[str]:
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# Basic rate limiting
-# ---------------------------------------------------------------------------
 
 rate_limit_lock = threading.Lock()
 hits_by_ip = defaultdict(deque)
@@ -563,123 +482,614 @@ def client_ip() -> str:
     ) or "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Web page
-# ---------------------------------------------------------------------------
-
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7edf8">
   <title>Luna Loves You</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+
     :root {
-      --bg: #fff7fa; --card: #ffffff; --ink: #2b2230; --muted: #7a6b80;
-      --accent: #c2477a; --user: #f6dbe8; --bot: #f1eef6;
+      color-scheme: light;
+      --ink: #30233d;
+      --muted: #82758f;
+      --plum: #76518f;
+      --plum-dark: #56396e;
+      --rose: #d77eaa;
+      --rose-pale: #f8e6ef;
+      --lavender: #eee7f7;
+      --paper: rgba(255, 255, 255, .86);
+      --line: rgba(120, 87, 143, .13);
+      --shadow: 0 24px 80px rgba(85, 56, 104, .13);
     }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #1d1822; --card: #272030; --ink: #f1eaf5; --muted: #a898b0;
-        --accent: #e06a9c; --user: #4a2c3d; --bot: #332b3b;
-      }
-    }
+
     * { box-sizing: border-box; }
+
     body {
-      margin: 0; font-family: system-ui, sans-serif; background: var(--bg);
-      color: var(--ink); display: flex; justify-content: center; min-height: 100vh;
+      min-height: 100vh;
+      margin: 0;
+      padding: 34px 18px;
+      display: grid;
+      place-items: center;
+      overflow-x: hidden;
+      color: var(--ink);
+      font-family: 'DM Sans', sans-serif;
+      background:
+        radial-gradient(circle at 12% 12%, rgba(255, 255, 255, .95), transparent 25%),
+        radial-gradient(circle at 88% 18%, rgba(237, 211, 235, .9), transparent 28%),
+        radial-gradient(circle at 10% 90%, rgba(245, 214, 229, .8), transparent 30%),
+        linear-gradient(135deg, #fbf4f8 0%, #f3edf9 48%, #f7edf4 100%);
     }
-    main {
-      width: 100%; max-width: 720px; padding: 16px; display: flex;
-      flex-direction: column; gap: 12px;
+
+    body::before,
+    body::after {
+      position: fixed;
+      z-index: -1;
+      content: '';
+      border-radius: 50%;
+      pointer-events: none;
+      filter: blur(1px);
     }
-    h1 { margin: 8px 0 0; color: var(--accent); font-size: 1.5rem; }
-    p.note { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.45; }
-    #log {
-      flex: 1; background: var(--card); border-radius: 14px; padding: 12px;
-      overflow-y: auto; min-height: 50vh; display: flex; flex-direction: column; gap: 10px;
+
+    body::before {
+      width: 290px;
+      height: 290px;
+      top: -115px;
+      right: 9%;
+      background: rgba(255, 255, 255, .35);
+      box-shadow: 0 0 90px rgba(255, 255, 255, .55);
     }
-    .msg {
-      padding: 10px 12px; border-radius: 12px; max-width: 88%;
-      white-space: pre-wrap; line-height: 1.4; overflow-wrap: anywhere;
+
+    body::after {
+      width: 230px;
+      height: 230px;
+      bottom: -100px;
+      left: 5%;
+      background: rgba(224, 190, 222, .19);
     }
-    .user { background: var(--user); align-self: flex-end; }
-    .bot { background: var(--bot); align-self: flex-start; }
-    form { display: flex; gap: 8px; }
-    input {
-      flex: 1; min-width: 0; padding: 12px; border-radius: 10px;
-      border: 1px solid var(--muted); background: var(--card); color: var(--ink); font-size: 1rem;
+
+    button, input { font: inherit; }
+    button { -webkit-tap-highlight-color: transparent; }
+
+    .shell {
+      width: min(100%, 880px);
+      min-height: min(850px, calc(100vh - 68px));
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, .9);
+      border-radius: 30px;
+      background: var(--paper);
+      box-shadow: var(--shadow), 0 4px 16px rgba(91, 58, 110, .05);
+      backdrop-filter: blur(20px);
     }
-    button {
-      padding: 12px 18px; border: 0; border-radius: 10px;
-      background: var(--accent); color: #fff; font-size: 1rem; cursor: pointer;
+
+    .topbar {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 23px 28px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(110deg, rgba(255,255,255,.94), rgba(250,241,249,.83));
     }
-    button:disabled { opacity: .5; cursor: wait; }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-width: 0;
+    }
+
+    .moon-mark {
+      position: relative;
+      width: 48px;
+      height: 48px;
+      flex: 0 0 48px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border-radius: 17px;
+      background: linear-gradient(145deg, #8f6ba7, #67477f);
+      box-shadow: 0 8px 18px rgba(104, 70, 129, .22);
+    }
+
+    .moon-mark::before {
+      width: 23px;
+      height: 23px;
+      content: '';
+      border-radius: 50%;
+      background: #fff5fa;
+      transform: translateX(-2px);
+      box-shadow: 0 0 18px rgba(255, 246, 251, .45);
+    }
+
+    .moon-mark::after {
+      position: absolute;
+      width: 22px;
+      height: 22px;
+      top: 9px;
+      left: 20px;
+      content: '';
+      border-radius: 50%;
+      background: #79558f;
+    }
+
+    .brand-copy { min-width: 0; }
+    .brand-name {
+      margin: 0;
+      font-family: 'Manrope', sans-serif;
+      font-size: 1.22rem;
+      font-weight: 800;
+      letter-spacing: -.045em;
+      line-height: 1.2;
+    }
+
+    .brand-tagline {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: .78rem;
+      letter-spacing: .01em;
+    }
+
+    .online-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+      padding: 9px 13px;
+      border: 1px solid rgba(119, 157, 126, .2);
+      border-radius: 999px;
+      color: #567c60;
+      background: rgba(237, 248, 239, .78);
+      font-size: .75rem;
+      font-weight: 700;
+    }
+
+    .online-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #69a879;
+      box-shadow: 0 0 0 4px rgba(105, 168, 121, .12);
+    }
+
+    .intro {
+      position: relative;
+      padding: 23px 30px 19px;
+      background: linear-gradient(100deg, rgba(247, 235, 246, .8), rgba(255, 245, 249, .55));
+    }
+
+    .eyebrow {
+      margin: 0 0 7px;
+      color: #9b719a;
+      font-size: .69rem;
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    .intro h2 {
+      margin: 0;
+      font-family: 'Manrope', sans-serif;
+      font-size: clamp(1.35rem, 3vw, 1.8rem);
+      font-weight: 800;
+      letter-spacing: -.055em;
+      line-height: 1.2;
+    }
+
+    .intro p:last-child {
+      max-width: 600px;
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: .9rem;
+      line-height: 1.55;
+    }
+
+    .chat-area {
+      min-height: 300px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 17px;
+      overflow-y: auto;
+      padding: 24px 30px 27px;
+      scroll-behavior: smooth;
+    }
+
+    .welcome-card {
+      position: relative;
+      max-width: 650px;
+      padding: 19px 20px;
+      border: 1px solid rgba(155, 119, 170, .15);
+      border-radius: 8px 22px 22px 22px;
+      background: linear-gradient(135deg, #fffafd, #f7f1fb);
+      box-shadow: 0 8px 24px rgba(99, 68, 118, .055);
+    }
+
+    .welcome-card p {
+      margin: 0;
+      color: #594b65;
+      font-size: .92rem;
+      line-height: 1.65;
+    }
+
+    .welcome-card strong { color: var(--plum-dark); }
+
+    .sparkle {
+      display: inline-block;
+      margin-right: 5px;
+      color: #c17ea7;
+      font-size: 1rem;
+    }
+
+    .suggestions-label {
+      margin: 3px 0 -5px;
+      color: #97889f;
+      font-size: .73rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+    }
+
+    .suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+    }
+
+    .suggestion {
+      padding: 9px 13px;
+      border: 1px solid rgba(128, 91, 151, .18);
+      border-radius: 999px;
+      color: #6c5280;
+      background: rgba(255, 255, 255, .82);
+      cursor: pointer;
+      font-size: .78rem;
+      font-weight: 600;
+      transition: transform .18s ease, border-color .18s ease, background .18s ease;
+    }
+
+    .suggestion:hover {
+      transform: translateY(-2px);
+      border-color: rgba(128, 91, 151, .42);
+      background: #fff;
+    }
+
+    .message-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      animation: appear .22s ease both;
+    }
+
+    .message-row.user-row { justify-content: flex-end; }
+
+    .avatar {
+      width: 31px;
+      height: 31px;
+      flex: 0 0 31px;
+      display: grid;
+      place-items: center;
+      border-radius: 11px;
+      color: white;
+      background: linear-gradient(145deg, #9472a9, #6d4e86);
+      font-size: .87rem;
+      box-shadow: 0 4px 10px rgba(103, 73, 125, .17);
+    }
+
+    .user-row .avatar {
+      order: 2;
+      color: #805d75;
+      background: #f5e4ed;
+      box-shadow: none;
+    }
+
+    .bubble {
+      max-width: min(78%, 620px);
+      padding: 12px 15px;
+      border: 1px solid rgba(137, 104, 154, .12);
+      border-radius: 7px 18px 18px 18px;
+      color: #51465c;
+      background: #f6f1fa;
+      font-size: .9rem;
+      line-height: 1.65;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    .user-row .bubble {
+      order: 1;
+      border-color: rgba(197, 119, 157, .14);
+      border-radius: 18px 7px 18px 18px;
+      color: #69475e;
+      background: linear-gradient(135deg, #f9eaf1, #f5e5ef);
+    }
+
+    .typing {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 20px;
+    }
+
+    .typing span {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #a783b4;
+      animation: bounce 1s infinite ease-in-out;
+    }
+
+    .typing span:nth-child(2) { animation-delay: .14s; }
+    .typing span:nth-child(3) { animation-delay: .28s; }
+
+    .composer-wrap {
+      padding: 17px 25px 21px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, .72);
+    }
+
+    .composer {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 8px 7px 17px;
+      border: 1px solid rgba(130, 95, 151, .2);
+      border-radius: 19px;
+      background: #fff;
+      box-shadow: 0 6px 20px rgba(99, 68, 118, .055);
+      transition: border-color .2s ease, box-shadow .2s ease;
+    }
+
+    .composer:focus-within {
+      border-color: rgba(128, 88, 154, .52);
+      box-shadow: 0 0 0 4px rgba(153, 112, 174, .09), 0 8px 24px rgba(99, 68, 118, .07);
+    }
+
+    #q {
+      width: 100%;
+      min-width: 0;
+      padding: 10px 0;
+      border: 0;
+      outline: 0;
+      color: var(--ink);
+      background: transparent;
+      font-size: .92rem;
+    }
+
+    #q::placeholder { color: #a69aaa; }
+
+    #send-button {
+      width: 44px;
+      height: 44px;
+      flex: 0 0 44px;
+      display: grid;
+      place-items: center;
+      border: 0;
+      border-radius: 14px;
+      color: white;
+      background: linear-gradient(145deg, #9671aa, #704c88);
+      box-shadow: 0 5px 12px rgba(105, 73, 130, .2);
+      cursor: pointer;
+      transition: transform .18s ease, opacity .18s ease, box-shadow .18s ease;
+    }
+
+    #send-button:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 16px rgba(105, 73, 130, .26);
+    }
+
+    #send-button:disabled { opacity: .5; cursor: wait; }
+    #send-button svg { width: 19px; height: 19px; }
+
+    .composer-hint {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 4px 0;
+      color: #a095aa;
+      font-size: .69rem;
+    }
+
+    .privacy-note { display: inline-flex; align-items: center; gap: 5px; }
+    .privacy-note svg { width: 12px; height: 12px; }
+
+    .bottom-note {
+      padding: 0 25px 17px;
+      color: #a095aa;
+      text-align: center;
+      font-size: .68rem;
+      line-height: 1.5;
+    }
+
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: .55; }
+      30% { transform: translateY(-5px); opacity: 1; }
+    }
+
+    @keyframes appear {
+      from { opacity: 0; transform: translateY(5px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 620px) {
+      body { padding: 0; background: #f8f0f7; }
+      .shell {
+        width: 100%;
+        min-height: 100dvh;
+        border: 0;
+        border-radius: 0;
+      }
+      .topbar { padding: 17px 18px; }
+      .moon-mark { width: 43px; height: 43px; flex-basis: 43px; }
+      .brand-name { font-size: 1.1rem; }
+      .brand-tagline { font-size: .7rem; }
+      .online-pill { padding: 8px 10px; font-size: .68rem; }
+      .intro { padding: 20px 20px 17px; }
+      .chat-area { padding: 20px 17px 23px; }
+      .bubble { max-width: 83%; font-size: .87rem; }
+      .composer-wrap { padding: 13px 15px 17px; }
+      .bottom-note { padding: 0 16px 14px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <h1>Luna Loves You</h1>
-    <p class="note">
-      General education only. This is not medical advice. See a doctor for worrying symptoms.
-      Answers are generated from a curated question-and-answer library and may still be wrong.
-      Your question is processed by third-party AI services. Please do not enter your name or other personal details.
-    </p>
-    <div id="log" aria-live="polite"></div>
-    <form id="f">
-      <input id="q" placeholder="Ask about periods, cramps, cycles..." autocomplete="off" required>
-      <button id="b" type="submit">Send</button>
-    </form>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="moon-mark" aria-hidden="true"></div>
+        <div class="brand-copy">
+          <h1 class="brand-name">Luna Loves You</h1>
+          <p class="brand-tagline">A softer space for period questions</p>
+        </div>
+      </div>
+      <div class="online-pill"><span class="online-dot"></span><span>Here to help</span></div>
+    </header>
+
+    <section class="intro">
+      <p class="eyebrow">Your menstrual health companion</p>
+      <h2>Let's talk about periods.</h2>
+      <p>No awkward questions here. Ask what is on your mind and explore reliable information at your own pace.</p>
+    </section>
+
+    <section id="log" class="chat-area" aria-live="polite" aria-label="Chat conversation">
+      <div class="welcome-card" id="welcome-card">
+        <p><span class="sparkle">✦</span><strong>Hi, I'm Luna.</strong> I'm glad you're here. You can ask me about periods, menstrual cycles, cramps, and related topics. We'll take it one question at a time.</p>
+      </div>
+      <p class="suggestions-label" id="suggestions-label">NOT SURE WHERE TO START?</p>
+      <div class="suggestions" id="suggestions">
+        <button class="suggestion" type="button">Why is my period late?</button>
+        <button class="suggestion" type="button">What causes period cramps?</button>
+        <button class="suggestion" type="button">How long does a period last?</button>
+      </div>
+    </section>
+
+    <section class="composer-wrap">
+      <form id="chat-form" class="composer">
+        <input id="q" maxlength="300" placeholder="Write your question to Luna..." autocomplete="off" aria-label="Your question" required>
+        <button id="send-button" type="submit" aria-label="Send message">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4.5 11.5 19 4.8l-4.7 14.7-2.7-6.1-7.1-1.9Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="m11.6 13.4 3.7-3.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </form>
+      <div class="composer-hint">
+        <span>Press Enter to send</span>
+        <span class="privacy-note">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6V10Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M12 14v2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          Keep personal details private
+        </span>
+      </div>
+    </section>
+
+    <footer class="bottom-note">For general education only, not a medical diagnosis. For severe or worrying symptoms, please speak with a healthcare professional.</footer>
   </main>
+
   <script>
     const log = document.getElementById('log');
-    const form = document.getElementById('f');
+    const form = document.getElementById('chat-form');
     const input = document.getElementById('q');
-    const button = document.getElementById('b');
+    const sendButton = document.getElementById('send-button');
+    const suggestions = document.getElementById('suggestions');
+    const suggestionsLabel = document.getElementById('suggestions-label');
+    const welcomeCard = document.getElementById('welcome-card');
 
-    function addMessage(cls, text) {
-      const element = document.createElement('div');
-      element.className = 'msg ' + cls;
-      element.textContent = text;
-      log.appendChild(element);
+    function addMessage(role, text) {
+      const row = document.createElement('div');
+      row.className = 'message-row ' + (role === 'user' ? 'user-row' : 'bot-row');
+
+      const avatar = document.createElement('div');
+      avatar.className = 'avatar';
+      avatar.textContent = role === 'user' ? '♡' : '☾';
+      avatar.setAttribute('aria-hidden', 'true');
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      log.appendChild(row);
       log.scrollTop = log.scrollHeight;
-      return element;
+      return bubble;
     }
 
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const question = input.value.trim();
-      if (!question) return;
+    function addTypingIndicator() {
+      const row = document.createElement('div');
+      row.className = 'message-row bot-row';
+      row.id = 'typing-indicator';
 
+      const avatar = document.createElement('div');
+      avatar.className = 'avatar';
+      avatar.textContent = '☾';
+      avatar.setAttribute('aria-hidden', 'true');
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.innerHTML = '<span class="typing" aria-label="Luna is thinking"><span></span><span></span><span></span></span>';
+
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      log.appendChild(row);
+      log.scrollTop = log.scrollHeight;
+      return row;
+    }
+
+    async function sendQuestion(question) {
+      const cleanQuestion = question.trim();
+      if (!cleanQuestion || sendButton.disabled) return;
+
+      welcomeCard?.remove();
+      suggestions?.remove();
+      suggestionsLabel?.remove();
+      addMessage('user', cleanQuestion);
       input.value = '';
-      button.disabled = true;
-      addMessage('user', question);
-      const answerElement = addMessage('bot', 'Luna is thinking...');
+      sendButton.disabled = true;
+      input.disabled = true;
+      const typing = addTypingIndicator();
 
       try {
         const response = await fetch('/chat', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({message: question})
+          body: JSON.stringify({message: cleanQuestion})
         });
         const answer = await response.text();
-        answerElement.textContent = answer || (response.ok ? 'No answer was returned.' : 'Something went wrong.');
+        typing.remove();
+        addMessage('bot', answer || (response.ok ? 'I could not prepare an answer just now. Please try again.' : 'Something went wrong. Please try again.'));
       } catch (error) {
-        answerElement.textContent = 'Network error. Please try again.';
+        typing.remove();
+        addMessage('bot', 'I could not reach the server just now. Please check your connection and try again.');
       } finally {
-        button.disabled = false;
+        sendButton.disabled = false;
+        input.disabled = false;
         input.focus();
         log.scrollTop = log.scrollHeight;
       }
+    }
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      sendQuestion(input.value);
+    });
+
+    suggestions?.addEventListener('click', (event) => {
+      const button = event.target.closest('button.suggestion');
+      if (button) sendQuestion(button.textContent);
     });
   </script>
 </body>
 </html>"""
-
-
-# ---------------------------------------------------------------------------
-# Flask routes
-# ---------------------------------------------------------------------------
 
 
 @app.get("/")
@@ -755,7 +1165,6 @@ def chat():
     if generated_answer:
         return Response(generated_answer, mimetype="text/plain")
 
-    # Keep the original CSV-grounded fallback behavior when every LLM provider fails.
     if matches[0][1] >= FALLBACK_MIN:
         fallback_answer = idx["answers"][matches[0][0]] + FOOTER
         return Response(fallback_answer, mimetype="text/plain")

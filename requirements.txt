@@ -1,5 +1,5 @@
-Flask>=3.0,<4
-gunicorn>=22,<24
-numpy>=1.26,<3
-scikit-learn>=1.4,<2
-requests>=2.31,<3
+Flask>=3.0,<4.0
+gunicorn>=22.0,<24.0
+numpy>=1.26,<3.0
+requests>=2.31,<3.0
+scikit-learn>=1.4,<2.0
