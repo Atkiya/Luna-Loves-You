@@ -8,7 +8,7 @@
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Atkiya/Luna-Loves-You)
 
-**Repository:** [Atkiya/Luna-Loves-You](https://github.com/Atkiya/Luna-Loves-You) · **Live app:** Add your service URL from the Render Dashboard here
+**Repository:** [Atkiya/Luna-Loves-You](https://github.com/Atkiya/Luna-Loves-You) · **Live app:** https://luna-loves-you.onrender.com/
 
 </div>
 
