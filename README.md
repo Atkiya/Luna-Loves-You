@@ -6,7 +6,6 @@
 
 ### A gentle, CSV-grounded menstrual health education chatbot
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Atkiya/Luna-Loves-You)
 
 **Repository:** [Atkiya/Luna-Loves-You](https://github.com/Atkiya/Luna-Loves-You) · **Live app:** https://luna-loves-you.onrender.com/
 
