@@ -19,6 +19,10 @@ Luna is a Flask-based chatbot that answers menstrual-health education questions 
 
 Luna is intended for general education. It does not diagnose medical conditions or provide medication doses.
 
+## Dataset used
+
+The dataset is merged version of MENST and Menstrual-Health-Awareness-Dataset avaiable at Huggingface
+
 ## How it works
 
 1. **Load the knowledge base.** Luna reads `menst_merged.csv` and identifies columns whose headers contain `Question` and `Answer`.
