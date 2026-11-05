@@ -1,4 +1,5 @@
-flask
-gunicorn
-scikit-learn
-requests
+Flask>=3.0,<4
+gunicorn>=22,<24
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+requests>=2.31,<3
