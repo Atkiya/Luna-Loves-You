@@ -4,7 +4,7 @@
 
 ![Luna, a smiling crescent moon holding a flower beneath a pastel night sky](assets/luna-mascot.png)
 
-### A gentle, CSV-grounded menstrual health education chatbot
+### A gentle, menstrual health education chatbot
 
 
 **Repository:** [Atkiya/Luna-Loves-You](https://github.com/Atkiya/Luna-Loves-You) · **Live app:** https://luna-loves-you.onrender.com/
