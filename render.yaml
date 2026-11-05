@@ -4,12 +4,16 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 300 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
-      - key: GGUF_REPO
-        value: your-username/luna-loves-you-gguf     # change this
-      - key: GGUF_FILE
-        value: luna-0.5b-Q4_K_M.gguf                 # switch to luna-0.5b-Q3_K_M.gguf if it runs out of memory
+      - key: GROQ_API_KEY
+        sync: false            # type the key in the Render dashboard
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GEMINI_API_KEY    # optional backup; delete this entry if you do not want Gemini used
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
