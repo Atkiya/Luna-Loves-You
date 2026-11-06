@@ -50,6 +50,3 @@ Luna provides general educational information and is not a substitute for medica
 
 Questions are sent to the selected third-party LLM provider when generation is enabled. Do not enter names, contact details, identifying information, or private medical records. Review the dataset and provider privacy terms before making the service publicly available.
 
-## License
-
-Add the license you intend to use for this project before redistribution. Until a license is included in the repository, users should not assume that the source code or dataset is licensed for reuse.
